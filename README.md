@@ -1,3 +1,17 @@
+### Holiday 2026
+For the 2026 end of year, the R&D team has decided to build a crane game out of an Opentrons Flex!
+This protocol will require an Opentrons Flex Gripper and an Opentrons Waste Chute!
+It is *highly* recommended to fill the deck with prizes to grab (presumably not labware!)
+
+#### Input System
+TBD !
+
+### Game Details
+The crane game begins when the Player loads the protocol, and selects "Resume"! After that, they'll have XX seconds to try and line up the gripper with a prize!
+The gripper will descend, attempt to grasp an object, and then dump said object out of the waste chute!
+
+### Holiday 2025
+
 With the launch of a new dynamic pipetting feature in 8.8 of Opentrons App we can now "draw" using the pipette. 
 What better way to take advantage of this than to decorate some cookies with royal icing.
 
