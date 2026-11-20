@@ -5,7 +5,6 @@ import enum
 import time
 import asyncio
 import os
-from itertools import islice
 import struct
 import threading
 import usb.core
@@ -37,6 +36,10 @@ class InputDirections(enum.Enum):
     TOWARDS_FRONT = 2
     LEFT = 3
     RIGHT = 4
+    REAR_LEFT = 5
+    REAR_RIGHT = 6
+    FRONT_LEFT = 7
+    FRONT_RIGHT = 8
 
 # Minimum distance (mm) to move the gantry along the X and Y axes based on user input
 # NOTE: Some napkin-math:  5mm @ 10 samples/sec means we'd cross all deck slots
@@ -109,7 +112,7 @@ def xbox_usb_reader(stop_event):
                 # Unpack signed 16-bit integers (little-endian) from bytes 10..17
                 lx, ly, rx, ry = struct.unpack("<hhhh", bytes(data[10:18]))
 
-                # Normalize to Pygame's -1.0 to 1.0 range (invert Y so up is -1.0, matching SDL)
+                # Normalize to generic Joystick's -1.0 to 1.0 range (invert Y so up is -1.0, matching SDL)
                 axes = [
                     max(-1.0, lx / 32767.0),
                     max(-1.0, -ly / 32767.0),
@@ -117,25 +120,42 @@ def xbox_usb_reader(stop_event):
                     max(-1.0, -ry / 32767.0),
                 ]
 
+                # Collect directions of given Axes
+                used_directions: list[InputDirections] = []
                 for axis_idx, val in enumerate(axes):
-                    # LEFT JOYSTICK X IS AXIS 0
-                    # RIGHT JOYSTICK Y IS AXIS 1
+                    # Left Joystick X is Axis 0
+                    # Left Joystick Y is Axis 1
                     # Below we will use ~0.1 as a deadzone buffer to account for stick drift
-                    
-                    if axis_idx == 0:
-                        if val > 0.1:
-                            # Right
-                            user_input_queue.append((InputDirections.RIGHT, abs(val) * MOVE_SCALE))
-                        elif val < -0.1:
-                            # Left
-                            user_input_queue.append((InputDirections.LEFT, abs(val) * MOVE_SCALE))
-                    if axis_idx == 1:
-                        if val > 0.1:
-                            # Right
-                            user_input_queue.append((InputDirections.TOWARDS_FRONT, abs(val) * MOVE_SCALE))
-                        elif val < -0.1:
-                            # Left
-                            user_input_queue.append((InputDirections.TOWARDS_REAR, abs(val) * MOVE_SCALE))
+
+                    if axis_idx == 0 and val > 0.1:
+                        used_directions.append(InputDirections.RIGHT)
+                    elif axis_idx == 0 and val < -0.1:
+                        used_directions.append(InputDirections.LEFT)
+                    if axis_idx == 1 and val > 0.1:
+                        used_directions.append(InputDirections.TOWARDS_FRONT)
+                    elif axis_idx == 1 and val < -0.1:
+                        used_directions.append(InputDirections.TOWARDS_REAR)
+
+                # Coordinate directions to input queue, accounting for diagonal inputs
+                if InputDirections.RIGHT in used_directions:
+                    if InputDirections.TOWARDS_FRONT in used_directions:
+                        user_input_queue.append((InputDirections.FRONT_RIGHT, abs(val) * MOVE_SCALE))
+                    elif InputDirections.TOWARDS_REAR in used_directions:
+                        user_input_queue.append((InputDirections.REAR_RIGHT, abs(val) * MOVE_SCALE))
+                    else:
+                        user_input_queue.append((InputDirections.RIGHT, abs(val) * MOVE_SCALE))
+                elif InputDirections.LEFT in used_directions:
+                    if InputDirections.TOWARDS_FRONT in used_directions:
+                        user_input_queue.append((InputDirections.FRONT_LEFT, abs(val) * MOVE_SCALE))
+                    elif InputDirections.TOWARDS_REAR in used_directions:
+                        user_input_queue.append((InputDirections.REAR_LEFT, abs(val) * MOVE_SCALE))
+                    else:
+                        user_input_queue.append((InputDirections.LEFT, abs(val) * MOVE_SCALE))
+                elif InputDirections.TOWARDS_REAR in used_directions:
+                    user_input_queue.append((InputDirections.TOWARDS_REAR, abs(val) * MOVE_SCALE))
+                elif InputDirections.TOWARDS_FRONT in used_directions:
+                    user_input_queue.append((InputDirections.TOWARDS_REAR, abs(val) * MOVE_SCALE))
+                
 
         except usb.core.USBTimeoutError:
             continue
@@ -228,6 +248,22 @@ async def protocol_actions_task(ctx: ProtocolContext, terminate_signal: asyncio.
                 case InputDirections.LEFT:
                     ctx.robot.move_axes_relative(
                         axis_map = {"X": (MIN_MOVE_DISTANCE * -1) * multiplier}
+                    )
+                case InputDirections.REAR_LEFT:
+                    ctx.robot.move_axes_relative(
+                        axis_map = {"Y": MIN_MOVE_DISTANCE * multiplier, "X": (MIN_MOVE_DISTANCE * -1) * multiplier}
+                    )
+                case InputDirections.REAR_RIGHT:
+                    ctx.robot.move_axes_relative(
+                        axis_map = {"Y": MIN_MOVE_DISTANCE * multiplier, "X": MIN_MOVE_DISTANCE * multiplier}
+                    )
+                case InputDirections.FRONT_LEFT:
+                    ctx.robot.move_axes_relative(
+                        axis_map = {"Y": (MIN_MOVE_DISTANCE * -1) * multiplier, "X": (MIN_MOVE_DISTANCE * -1) * multiplier}
+                    )
+                case InputDirections.FRONT_RIGHT:
+                    ctx.robot.move_axes_relative(
+                        axis_map = {"Y": (MIN_MOVE_DISTANCE * -1) * multiplier, "X": MIN_MOVE_DISTANCE * multiplier}
                     )
         
         await asyncio.sleep(INPUT_SAMPLE_RATE)
