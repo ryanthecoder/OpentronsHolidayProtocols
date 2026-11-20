@@ -5,7 +5,6 @@ import enum
 import time
 import asyncio
 import os
-from itertools import islice
 import struct
 import threading
 import usb.core
@@ -31,12 +30,17 @@ XBOX_INIT_PACKET = bytes([0x05, 0x20, 0x00, 0x01, 0x00])
 
 # Flag to control device input, used for XBox input control
 USER_XBOX_INPUT = True
+DEADZONE = 0.2
 
 class InputDirections(enum.Enum):
     TOWARDS_REAR = 1
     TOWARDS_FRONT = 2
     LEFT = 3
     RIGHT = 4
+    REAR_LEFT = 5
+    REAR_RIGHT = 6
+    FRONT_LEFT = 7
+    FRONT_RIGHT = 8
 
 # Minimum distance (mm) to move the gantry along the X and Y axes based on user input
 # NOTE: Some napkin-math:  5mm @ 10 samples/sec means we'd cross all deck slots
@@ -109,7 +113,7 @@ def xbox_usb_reader(stop_event):
                 # Unpack signed 16-bit integers (little-endian) from bytes 10..17
                 lx, ly, rx, ry = struct.unpack("<hhhh", bytes(data[10:18]))
 
-                # Normalize to Pygame's -1.0 to 1.0 range (invert Y so up is -1.0, matching SDL)
+                # Normalize to generic Joystick's -1.0 to 1.0 range (invert Y so up is -1.0, matching SDL)
                 axes = [
                     max(-1.0, lx / 32767.0),
                     max(-1.0, -ly / 32767.0),
@@ -117,25 +121,45 @@ def xbox_usb_reader(stop_event):
                     max(-1.0, -ry / 32767.0),
                 ]
 
+                # Collect directions of given Axes
+                used_directions: list[InputDirections] = []
                 for axis_idx, val in enumerate(axes):
-                    # LEFT JOYSTICK X IS AXIS 0
-                    # RIGHT JOYSTICK Y IS AXIS 1
-                    # Below we will use ~0.1 as a deadzone buffer to account for stick drift
-                    
-                    if axis_idx == 0:
-                        if val > 0.1:
-                            # Right
-                            user_input_queue.append((InputDirections.RIGHT, abs(val) * MOVE_SCALE))
-                        elif val < -0.1:
-                            # Left
-                            user_input_queue.append((InputDirections.LEFT, abs(val) * MOVE_SCALE))
-                    if axis_idx == 1:
-                        if val > 0.1:
-                            # Right
-                            user_input_queue.append((InputDirections.TOWARDS_FRONT, abs(val) * MOVE_SCALE))
-                        elif val < -0.1:
-                            # Left
-                            user_input_queue.append((InputDirections.TOWARDS_REAR, abs(val) * MOVE_SCALE))
+                    # Left Joystick X is Axis 0
+                    # Left Joystick Y is Axis 1
+                    # Below we will use a deadzone buffer to account for stick drift
+
+                    if axis_idx == 0 and val > DEADZONE:
+                        used_directions.append(InputDirections.RIGHT)
+                    elif axis_idx == 0 and val < DEADZONE * -1:
+                        used_directions.append(InputDirections.LEFT)
+                    if axis_idx == 1 and val > DEADZONE:
+                        used_directions.append(InputDirections.TOWARDS_FRONT)
+                    elif axis_idx == 1 and val < DEADZONE * -1:
+                        used_directions.append(InputDirections.TOWARDS_REAR)
+
+                # Coordinate directions to input queue, accounting for diagonal inputs
+                if InputDirections.RIGHT in used_directions:
+                    if InputDirections.TOWARDS_FRONT in used_directions:
+                        user_input_queue.append((InputDirections.FRONT_RIGHT, abs(val) * MOVE_SCALE))
+                    elif InputDirections.TOWARDS_REAR in used_directions:
+                        user_input_queue.append((InputDirections.REAR_RIGHT, abs(val) * MOVE_SCALE))
+                    else:
+                        user_input_queue.append((InputDirections.RIGHT, abs(val) * MOVE_SCALE))
+                elif InputDirections.LEFT in used_directions:
+                    if InputDirections.TOWARDS_FRONT in used_directions:
+                        user_input_queue.append((InputDirections.FRONT_LEFT, abs(val) * MOVE_SCALE))
+                    elif InputDirections.TOWARDS_REAR in used_directions:
+                        user_input_queue.append((InputDirections.REAR_LEFT, abs(val) * MOVE_SCALE))
+                    else:
+                        user_input_queue.append((InputDirections.LEFT, abs(val) * MOVE_SCALE))
+                elif InputDirections.TOWARDS_REAR in used_directions:
+                    user_input_queue.append((InputDirections.TOWARDS_REAR, abs(val) * MOVE_SCALE))
+                elif InputDirections.TOWARDS_FRONT in used_directions:
+                    user_input_queue.append((InputDirections.TOWARDS_FRONT, abs(val) * MOVE_SCALE))
+                else:
+                    # Clear the queue if we are centered with no inputs
+                    user_input_queue.clear()
+                
 
         except usb.core.USBTimeoutError:
             continue
@@ -183,7 +207,8 @@ async def protocol_actions_task(ctx: ProtocolContext, terminate_signal: asyncio.
 
     def _grab_prize():
         """Move the gripper towards the deck at it's current location, and then closes the jaws."""
-        
+
+        ctx.comment("grabbing") # NOTE: This is needed by the front end, don't delete!
         ctx.robot.move_axes_to(
             axis_map= {"Z_G": fake_plate.highest_z},
         )
@@ -203,8 +228,11 @@ async def protocol_actions_task(ctx: ProtocolContext, terminate_signal: asyncio.
         ctx.robot.open_gripper_jaw()
 
     # Gameplay Logic
+    hw_api = ctx._core.get_hardware()
+    ctx.home()
     ctx.pause(msg="Begin Playing Crane Game")
     # Gameplay is timer based, players have until time expires to position the gantry
+    user_input_queue.clear()
     start_time = time.monotonic()
     while time.monotonic() - start_time <= PLAY_TIMER:
         # Process user inputs to move the gantry around
@@ -214,22 +242,29 @@ async def protocol_actions_task(ctx: ProtocolContext, terminate_signal: asyncio.
             multiplier = last_input[1]
             match direction:
                 case InputDirections.TOWARDS_REAR:
-                    ctx.robot.move_axes_relative(
-                        axis_map = {"Y": MIN_MOVE_DISTANCE * multiplier}
-                    )
+                    hw_api.move_rel(mount=Mount.EXTENSION, delta=Point(x=0, y=MIN_MOVE_DISTANCE * multiplier, z=0))
+
                 case InputDirections.TOWARDS_FRONT:
-                    ctx.robot.move_axes_relative(
-                        axis_map = {"Y": (MIN_MOVE_DISTANCE * -1) * multiplier}
-                    )
+                    hw_api.move_rel(mount=Mount.EXTENSION, delta=Point(x=0, y=(MIN_MOVE_DISTANCE * -1) * multiplier, z=0))
+
                 case InputDirections.RIGHT:
-                    ctx.robot.move_axes_relative(
-                        axis_map = {"X": MIN_MOVE_DISTANCE * multiplier}
-                    )
+                    hw_api.move_rel(mount=Mount.EXTENSION, delta=Point(x=MIN_MOVE_DISTANCE * multiplier, y=0, z=0))
+                    
                 case InputDirections.LEFT:
-                    ctx.robot.move_axes_relative(
-                        axis_map = {"X": (MIN_MOVE_DISTANCE * -1) * multiplier}
-                    )
-        
+                    hw_api.move_rel(mount=Mount.EXTENSION, delta=Point(x=(MIN_MOVE_DISTANCE * -1) * multiplier, y=0, z=0))
+                    
+                case InputDirections.REAR_LEFT:
+                    hw_api.move_rel(mount=Mount.EXTENSION, delta=Point(x=(MIN_MOVE_DISTANCE * -1) * multiplier, y=MIN_MOVE_DISTANCE * multiplier, z=0))
+                    
+                case InputDirections.REAR_RIGHT:
+                    hw_api.move_rel(mount=Mount.EXTENSION, delta=Point(x=MIN_MOVE_DISTANCE * multiplier, y=MIN_MOVE_DISTANCE * multiplier, z=0))
+                    
+                case InputDirections.FRONT_LEFT:
+                    hw_api.move_rel(mount=Mount.EXTENSION, delta=Point(x=(MIN_MOVE_DISTANCE * -1) * multiplier, y=(MIN_MOVE_DISTANCE * -1) * multiplier, z=0))
+                    
+                case InputDirections.FRONT_RIGHT:
+                    hw_api.move_rel(mount=Mount.EXTENSION, delta=Point(x=MIN_MOVE_DISTANCE * multiplier, y=(MIN_MOVE_DISTANCE * -1) * multiplier, z=0))
+
         await asyncio.sleep(INPUT_SAMPLE_RATE)
 
     terminate_signal.set()
