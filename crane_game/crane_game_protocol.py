@@ -29,7 +29,8 @@ PRODUCT_ID = 0x02DD
 XBOX_INIT_PACKET = bytes([0x05, 0x20, 0x00, 0x01, 0x00])
 
 # Flag to control device input, used for XBox input control
-USER_XBOX_INPUT = True
+USER_XBOX_INPUT = False
+USER_JOYSTICK_INPUT = True
 DEADZONE = 0.2
 
 class InputDirections(enum.Enum):
@@ -41,12 +42,13 @@ class InputDirections(enum.Enum):
     REAR_RIGHT = 6
     FRONT_LEFT = 7
     FRONT_RIGHT = 8
+    DROP_CLAW = 9
 
 # Minimum distance (mm) to move the gantry along the X and Y axes based on user input
 # NOTE: Some napkin-math:  5mm @ 10 samples/sec means we'd cross all deck slots
 # right to left (350mm~) in 7 seconds~ (not accounting for command exec time), if
 # that feels too fast or slow we can adjust!
-MIN_MOVE_DISTANCE = 10.0
+MIN_MOVE_DISTANCE = 2.5
 MOVE_SCALE = 10.0 # Scales off the Joystick
 
 # Sample rate (S) for user inputs
@@ -74,6 +76,97 @@ TEST_INPUTS = [
     (InputDirections.TOWARDS_REAR, 1),
     (InputDirections.RIGHT, 1),
 ]
+
+def axis_to_queue_mapper(axes_data: list[float]):
+    """Collect directions of given Axes and submit them to the user input queue."""
+    used_directions: list[InputDirections] = []
+    highest_val = 0.1
+    # Joystick X is Axis 0
+    # Joystick Y is Axis 1
+    # Below we will use a deadzone buffer to account for stick drift
+    for axis_idx, val in enumerate(axes_data):
+        if axis_idx == 0 and val > DEADZONE:
+            used_directions.append(InputDirections.RIGHT)
+        elif axis_idx == 0 and val < DEADZONE * -1:
+            used_directions.append(InputDirections.LEFT)
+        if axis_idx == 1 and val > DEADZONE:
+            used_directions.append(InputDirections.TOWARDS_FRONT)
+        elif axis_idx == 1 and val < DEADZONE * -1:
+            used_directions.append(InputDirections.TOWARDS_REAR)
+
+        if abs(val) > highest_val:
+            highest_val = abs(val)
+
+    # Coordinate directions to input queue, accounting for diagonal inputs
+    if InputDirections.RIGHT in used_directions:
+        if InputDirections.TOWARDS_FRONT in used_directions:
+            user_input_queue.append((InputDirections.FRONT_RIGHT, highest_val * MOVE_SCALE))
+        elif InputDirections.TOWARDS_REAR in used_directions:
+            user_input_queue.append((InputDirections.REAR_RIGHT, highest_val * MOVE_SCALE))
+        else:
+            user_input_queue.append((InputDirections.RIGHT, highest_val * MOVE_SCALE))
+    elif InputDirections.LEFT in used_directions:
+        if InputDirections.TOWARDS_FRONT in used_directions:
+            user_input_queue.append((InputDirections.FRONT_LEFT, highest_val * MOVE_SCALE))
+        elif InputDirections.TOWARDS_REAR in used_directions:
+            user_input_queue.append((InputDirections.REAR_LEFT, highest_val * MOVE_SCALE))
+        else:
+            user_input_queue.append((InputDirections.LEFT, highest_val * MOVE_SCALE))
+    elif InputDirections.TOWARDS_REAR in used_directions:
+        user_input_queue.append((InputDirections.TOWARDS_REAR, highest_val * MOVE_SCALE))
+    elif InputDirections.TOWARDS_FRONT in used_directions:
+        user_input_queue.append((InputDirections.TOWARDS_FRONT, highest_val * MOVE_SCALE))
+    else:
+        # Clear the queue if we are centered with no inputs
+        # Ensure a DROP_CLAW commands persist
+        if InputDirections.DROP_CLAW in user_input_queue:
+            user_input_queue.clear()
+            user_input_queue.append((InputDirections.DROP_CLAW, 0))
+        else:
+            user_input_queue.clear()
+
+def joystick_usb_reader(stop_event):
+    """Sample a USB Joystick Controller, requires `pip install pygame`."""
+    import pygame
+    pygame.init()
+
+    joysticks = {}
+    while not stop_event.is_set():
+        # Event processing step.
+        # Possible joystick events: JOYAXISMOTION, JOYBALLMOTION, JOYBUTTONDOWN,
+        # JOYBUTTONUP, JOYHATMOTION, JOYDEVICEADDED, JOYDEVICEREMOVED
+        for event in pygame.event.get():
+            if event.type == pygame.JOYBUTTONDOWN:
+                if event.button == 0:
+                    joystick = joysticks[event.instance_id]
+            # Handle hotplugging
+            if event.type == pygame.JOYDEVICEADDED:
+                # This event will be generated when the program starts for every
+                # joystick, filling up the list without needing to create them manually.
+                joy = pygame.joystick.Joystick(event.device_index)
+                joysticks[joy.get_instance_id()] = joy
+            if event.type == pygame.JOYDEVICEREMOVED:
+                del joysticks[event.instance_id]
+                
+
+        # For each joystick:
+        for joystick in joysticks.values():
+            # Usually axis run in pairs, up/down for one, and left/right for the other.
+
+            axes_data: list[float] = []
+            axes_data.append(joystick.get_axis(0)) # X Axis
+            axes_data.append(joystick.get_axis(1)) # Y Axis
+
+            axis_to_queue_mapper(axes_data)
+
+            # Quick drop the claw and end the game early if the "Drop" buttons are pressed
+            # NOTE: On the Joystick USB Controller, these are the two Blue buttons above the stick.
+            if joystick.get_button(0) == 1 or joystick.get_button(1) == 1:
+                user_input_queue.append((InputDirections.DROP_CLAW, 0))
+                
+    # Release the pygame context from this task once it's done.
+    pygame.quit()
+
 
 def xbox_usb_reader(stop_event):
     """Background thread that reads raw USB packets and posts axis events."""
@@ -121,44 +214,7 @@ def xbox_usb_reader(stop_event):
                     max(-1.0, -ry / 32767.0),
                 ]
 
-                # Collect directions of given Axes
-                used_directions: list[InputDirections] = []
-                for axis_idx, val in enumerate(axes):
-                    # Left Joystick X is Axis 0
-                    # Left Joystick Y is Axis 1
-                    # Below we will use a deadzone buffer to account for stick drift
-
-                    if axis_idx == 0 and val > DEADZONE:
-                        used_directions.append(InputDirections.RIGHT)
-                    elif axis_idx == 0 and val < DEADZONE * -1:
-                        used_directions.append(InputDirections.LEFT)
-                    if axis_idx == 1 and val > DEADZONE:
-                        used_directions.append(InputDirections.TOWARDS_FRONT)
-                    elif axis_idx == 1 and val < DEADZONE * -1:
-                        used_directions.append(InputDirections.TOWARDS_REAR)
-
-                # Coordinate directions to input queue, accounting for diagonal inputs
-                if InputDirections.RIGHT in used_directions:
-                    if InputDirections.TOWARDS_FRONT in used_directions:
-                        user_input_queue.append((InputDirections.FRONT_RIGHT, abs(val) * MOVE_SCALE))
-                    elif InputDirections.TOWARDS_REAR in used_directions:
-                        user_input_queue.append((InputDirections.REAR_RIGHT, abs(val) * MOVE_SCALE))
-                    else:
-                        user_input_queue.append((InputDirections.RIGHT, abs(val) * MOVE_SCALE))
-                elif InputDirections.LEFT in used_directions:
-                    if InputDirections.TOWARDS_FRONT in used_directions:
-                        user_input_queue.append((InputDirections.FRONT_LEFT, abs(val) * MOVE_SCALE))
-                    elif InputDirections.TOWARDS_REAR in used_directions:
-                        user_input_queue.append((InputDirections.REAR_LEFT, abs(val) * MOVE_SCALE))
-                    else:
-                        user_input_queue.append((InputDirections.LEFT, abs(val) * MOVE_SCALE))
-                elif InputDirections.TOWARDS_REAR in used_directions:
-                    user_input_queue.append((InputDirections.TOWARDS_REAR, abs(val) * MOVE_SCALE))
-                elif InputDirections.TOWARDS_FRONT in used_directions:
-                    user_input_queue.append((InputDirections.TOWARDS_FRONT, abs(val) * MOVE_SCALE))
-                else:
-                    # Clear the queue if we are centered with no inputs
-                    user_input_queue.clear()
+                axis_to_queue_mapper(axes)
                 
 
         except usb.core.USBTimeoutError:
@@ -170,18 +226,16 @@ def xbox_usb_reader(stop_event):
     usb.util.release_interface(dev, 0)
 
 async def input_sampler_task(terminate_signal: asyncio.Event):
-    """This is the task used to sample user input, input is collected through -TBD-."""
-    # TODO this whole task is TBD
-    # We might sample input here through a controller driver
-    # Or through a web socket or endpointed called from an app (or the ODD even)
-    # We could even take input via python requests through Pyro from other devices (like a laptop)
-
-    # Logic wise this task will need to queue up inputs and remove stale ones when it can
+    """This is the task used to sample user input, input is collected through either Joystick or Xbox USB Controller, alternative an input demo."""
 
     device_thread_terminator = threading.Event()
     if USER_XBOX_INPUT:
-        usb_thread = threading.Thread(target=xbox_usb_reader, args=(device_thread_terminator,), daemon=True)
-        usb_thread.start()
+        xbox_usb_thread = threading.Thread(target=xbox_usb_reader, args=(device_thread_terminator,), daemon=True)
+        xbox_usb_thread.start()
+    elif USER_JOYSTICK_INPUT:
+        joystick_usb_thread = threading.Thread(target=joystick_usb_reader, args=(device_thread_terminator,), daemon=True)
+        joystick_usb_thread.start()
+
 
     while not terminate_signal.is_set():
         # NOTE: This is designed to maintain sampling until the `protocol_actions_task`` is complete!
@@ -265,6 +319,9 @@ async def protocol_actions_task(ctx: ProtocolContext, terminate_signal: asyncio.
                 case InputDirections.FRONT_RIGHT:
                     hw_api.move_rel(mount=Mount.EXTENSION, delta=Point(x=MIN_MOVE_DISTANCE * multiplier, y=(MIN_MOVE_DISTANCE * -1) * multiplier, z=0))
 
+                case InputDirections.DROP_CLAW:
+                    # QUIT THE GAME EARLY, DROP THE CLAW!
+                    break
         await asyncio.sleep(INPUT_SAMPLE_RATE)
 
     terminate_signal.set()
@@ -282,11 +339,12 @@ def run(ctx: ProtocolContext):
     # In the game logic we do a few things:
     # 1. Assert that the player wants to start by "Unpausing"
     # 2. During play, move the gripper through a number of samples until play time expires
-    # 3. When time is up, the gripper will:
+    # 3. During play, a user can click a "Drop Claw" button to end the game early
+    # 4. When time is up, the gripper will:
     #    (1). Move down to near-deck level and execute `close_gripper_jaw`
     #    (2). Retract fully
     #    (3). Return to the Waste Chute (Prize Chute) and execute `open_gripper_jaw`
-    # 4. At the end of the "Game" the protocol will cleanly teardown
+    # 5. At the end of the "Game" the protocol will cleanly teardown
 
     # NOTE: On Analysis: This protocol will take at least as long to analyze as the PLAY_TIMER length.
 
